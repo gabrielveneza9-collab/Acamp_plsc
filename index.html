@@ -113,6 +113,11 @@ h1 em{font-style:italic;font-weight:500;-webkit-text-fill-color:transparent;
 .total-num #total{display:inline-block;transform-origin:left bottom;font-variant-numeric:tabular-nums}
 .total-num small{font-family:var(--font-body);font-size:1.05rem;font-weight:600;letter-spacing:0;opacity:.85}
 .total-meta{margin:6px 0 0;font-size:.95rem;opacity:.88}
+.live{margin:10px 0 0;display:flex;align-items:center;gap:8px;font-size:.85rem;font-weight:600;line-height:1.35}
+.live i{width:9px;height:9px;border-radius:50%;background:#9aabc6;flex:none}
+.live[data-state="on"] i{background:#4ade80;animation:pulse 2s ease-out infinite}
+.live[data-state="off"] i{background:#fbbf24}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(74,222,128,.6)}70%{box-shadow:0 0 0 8px rgba(74,222,128,0)}100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
 .share-wrap{margin-top:22px}
 .share{display:flex;gap:4px;height:12px;border-radius:999px;background:rgba(255,255,255,.12);padding:2px}
 .share span{min-width:8px;border-radius:999px;transition:flex-grow .5s var(--ease)}
@@ -350,6 +355,7 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
         <p class="total-num" aria-hidden="true"><span id="total">0</span><small>pontos</small></p>
         <p class="sr-only" id="totalLive" aria-live="polite"></p>
         <p class="total-meta" id="meta"></p>
+        <p class="live" id="live" data-state="connecting"><i aria-hidden="true"></i><span id="liveText">Conectando ao placar…</span></p>
         <div class="share-wrap" id="shareWrap">
           <div class="share" id="share" aria-hidden="true"></div>
           <ul class="legend" id="legend" aria-label="Pontos por item"></ul>
@@ -370,7 +376,7 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
         <p class="ex">Ex.: o leite em pó vale <b>120 pontos</b>, cada pacote é <b>1 unidade</b> e você tem <b>21 pacotes</b>: 120 × 1 × 21 = <b>2.520 pontos</b>.</p>
         <p class="note">
           <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2" fill="currentColor"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.6"/></svg>
-          <span>Nome, pontos e unidades dos itens seguem a tabela oficial e não podem ser alterados. Só a quantidade de pacotes muda.</span>
+          <span>Nome, pontos e unidades dos itens seguem a tabela oficial e não podem ser alterados. Só a quantidade de pacotes muda, e qualquer mudança aparece para todo mundo em poucos segundos.</span>
         </p>
       </section>
     </aside>
@@ -623,15 +629,78 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { toast.classList.remove('show'); snapshot = null; }, 6000);
   }
+  // ---------- placar compartilhado (todo mundo vê o mesmo, atualiza a cada 3 s) ----------
+  const API = '/api/placar';
+  const POLL_MS = 3000;
+  const liveEl = $('live'), liveText = $('liveText');
+  let pollTimer = 0, writeSeq = 0, pendingWrites = 0, lastWriteAt = 0;
+
+  function setLive(state, text) { liveEl.dataset.state = state; liveText.textContent = text; }
+  const markOnline = () => setLive('on', 'Ao vivo · todos veem o mesmo placar');
+  const markOffline = () => setLive('off', 'Sem conexão com o placar · mostrando os valores deste aparelho');
+
+  // aplica os valores do servidor sem atrapalhar quem está digitando
+  function applyRemote(pacotes) {
+    if (!pacotes) return;
+    let changed = false;
+    items.forEach(item => {
+      const v = pacotes[item.id];
+      if (!Number.isInteger(v) || v === item.qty) return;
+      const card = list.querySelector(`.item[data-id="${item.id}"]`);
+      const input = card && card.querySelector('[data-field="qty"]');
+      if (input && document.activeElement === input) return;
+      item.qty = v; changed = true;
+      if (input) input.value = v;
+      if (card) updateCard(card, item, true);
+    });
+    if (changed) refreshTotals();
+  }
+
+  async function call(method, body) {
+    const opts = { method, cache: 'no-store' };
+    if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
+    const r = await fetch(API, opts);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }
+
+  async function poll() {
+    clearTimeout(pollTimer);
+    const startedAt = Date.now();
+    try {
+      const data = await call('GET');
+      // ignora leituras que começaram antes de uma mudança local ainda não confirmada
+      if (startedAt >= lastWriteAt && pendingWrites === 0) applyRemote(data.pacotes);
+      markOnline();
+    } catch (e) { markOffline(); }
+    if (!document.hidden) pollTimer = setTimeout(poll, POLL_MS);
+  }
+
+  async function send(body) {
+    lastWriteAt = Date.now();
+    pendingWrites++;
+    const seq = ++writeSeq;
+    try {
+      const data = await call('POST', body);
+      pendingWrites--;
+      if (seq === writeSeq && pendingWrites === 0) applyRemote(data.pacotes);
+      markOnline();
+    } catch (e) { pendingWrites--; markOffline(); }
+  }
+
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); else clearTimeout(pollTimer); });
+
   undoBtn.addEventListener('click', () => {
     if (!snapshot) return;
     items = snapshot; snapshot = null;
     toast.classList.remove('show');
     renderAll();
+    send({ op: 'setAll', values: Object.fromEntries(items.map(i => [i.id, i.qty])) });
   });
   const clone = () => items.map(i => ({ ...i }));
   const findItem = card => items.find(i => i.id === card?.dataset.id);
 
+  const typing = {};
   list.addEventListener('input', e => {
     const input = e.target.closest('[data-field="qty"]');
     if (!input) return;
@@ -640,6 +709,9 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
     item.qty = toQty(input.value);
     updateCard(card, item, true);
     refreshTotals();
+    lastWriteAt = Date.now();
+    clearTimeout(typing[item.id]);
+    typing[item.id] = setTimeout(() => send({ op: 'set', id: item.id, qty: item.qty }), 600);
   });
   list.addEventListener('change', e => {
     const input = e.target.closest('[data-field="qty"]');
@@ -652,14 +724,18 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
     if (!step) return;
     const card = step.closest('.item'), item = findItem(card);
     if (!item) return;
-    item.qty = Math.max(0, item.qty + Number(step.dataset.step));
+    const delta = Number(step.dataset.step);
+    if (item.qty + delta < 0) return;
+    item.qty += delta;
     card.querySelector('[data-field="qty"]').value = item.qty;
     updateCard(card, item, true);
     refreshTotals();
+    send({ op: 'inc', id: item.id, delta });
   });
 
   $('zeroBtn').addEventListener('click', () => {
     if (!items.some(i => i.qty > 0)) return;
+    if (!confirm('Zerar os pacotes de todos os itens? Isso muda o placar para todo mundo.')) return;
     const before = clone();
     items.forEach(i => { i.qty = 0; });
     list.querySelectorAll('.item').forEach(card => {
@@ -669,6 +745,7 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
       updateCard(card, item, true);
     });
     refreshTotals();
+    send({ op: 'setAll', values: Object.fromEntries(items.map(i => [i.id, 0])) });
     offerUndo('Pacotes zerados', before);
   });
 
@@ -679,6 +756,7 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
   }
 
   renderAll();
+  poll();
 })();
 </script>
 </body>
