@@ -438,6 +438,7 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
   </article>
 </template>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.57.4/dist/umd/supabase.min.js"></script>
 <script>
 (() => {
   // Tabela oficial: nome, pontos e unidades são fixos. Só "qty" (pacotes) é editável.
@@ -629,23 +630,30 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { toast.classList.remove('show'); snapshot = null; }, 6000);
   }
-  // ---------- placar compartilhado (todo mundo vê o mesmo, atualiza a cada 3 s) ----------
-  const API = '/api/placar';
-  const POLL_MS = 3000;
+  // ---------- placar compartilhado (Supabase Realtime: muda para todo mundo na hora) ----------
+  // Dados do projeto: Supabase > Project Settings > API Keys.
+  // Use só a chave PUBLISHABLE (ou "anon"), que é pública por natureza.
+  // NUNCA coloque aqui a chave secret / service_role.
+  const SUPABASE_URL = '';
+  const SUPABASE_KEY = '';
+  const BACKUP_POLL_MS = 15000;   // conferência extra, caso o tempo real caia
   const liveEl = $('live'), liveText = $('liveText');
-  let pollTimer = 0, writeSeq = 0, pendingWrites = 0, lastWriteAt = 0;
+  const pending = {};             // escritas em andamento, por item
+  const typing = {};              // digitação aguardando para enviar, por item
+  let sb = null, pollTimer = 0, realtimeOk = false;
 
   function setLive(state, text) { liveEl.dataset.state = state; liveText.textContent = text; }
-  const markOnline = () => setLive('on', 'Ao vivo · todos veem o mesmo placar');
+  const markOnline = () => setLive('on', realtimeOk ? 'Ao vivo · todos veem o mesmo placar' : 'Conectado · atualiza a cada 15 s');
   const markOffline = () => setLive('off', 'Sem conexão com o placar · mostrando os valores deste aparelho');
+  const busy = id => (pending[id] || 0) > 0 || !!typing[id];
 
-  // aplica os valores do servidor sem atrapalhar quem está digitando
+  // aplica os valores do banco sem atrapalhar quem está clicando ou digitando
   function applyRemote(pacotes) {
     if (!pacotes) return;
     let changed = false;
     items.forEach(item => {
       const v = pacotes[item.id];
-      if (!Number.isInteger(v) || v === item.qty) return;
+      if (!Number.isInteger(v) || v === item.qty || busy(item.id)) return;
       const card = list.querySelector(`.item[data-id="${item.id}"]`);
       const input = card && card.querySelector('[data-field="qty"]');
       if (input && document.activeElement === input) return;
@@ -656,39 +664,55 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
     if (changed) refreshTotals();
   }
 
-  async function call(method, body) {
-    const opts = { method, cache: 'no-store' };
-    if (body) { opts.headers = { 'Content-Type': 'application/json' }; opts.body = JSON.stringify(body); }
-    const r = await fetch(API, opts);
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
+  async function fetchAll() {
+    if (!sb) { markOffline(); return; }
+    try {
+      const { data, error } = await sb.from('pacotes').select('id,qty');
+      if (error) throw error;
+      applyRemote(Object.fromEntries(data.map(r => [r.id, r.qty])));
+      markOnline();
+    } catch (e) { console.error('placar:', e); markOffline(); }
   }
 
-  async function poll() {
+  function schedulePoll() {
     clearTimeout(pollTimer);
-    const startedAt = Date.now();
-    try {
-      const data = await call('GET');
-      // ignora leituras que começaram antes de uma mudança local ainda não confirmada
-      if (startedAt >= lastWriteAt && pendingWrites === 0) applyRemote(data.pacotes);
-      markOnline();
-    } catch (e) { markOffline(); }
-    if (!document.hidden) pollTimer = setTimeout(poll, POLL_MS);
+    if (!document.hidden) pollTimer = setTimeout(async () => { await fetchAll(); schedulePoll(); }, BACKUP_POLL_MS);
   }
 
   async function send(body) {
-    lastWriteAt = Date.now();
-    pendingWrites++;
-    const seq = ++writeSeq;
+    if (!sb) { markOffline(); return; }
+    const ids = body.op === 'setAll' ? Object.keys(body.values) : [body.id];
+    ids.forEach(id => { pending[id] = (pending[id] || 0) + 1; });
     try {
-      const data = await call('POST', body);
-      pendingWrites--;
-      if (seq === writeSeq && pendingWrites === 0) applyRemote(data.pacotes);
-      markOnline();
-    } catch (e) { pendingWrites--; markOffline(); }
+      let res;
+      if (body.op === 'inc') res = await sb.rpc('incrementar_pacote', { item: body.id, delta: body.delta });
+      else if (body.op === 'set') res = await sb.rpc('definir_pacote', { item: body.id, quantidade: body.qty });
+      else res = await sb.rpc('definir_pacotes', { valores: body.values });
+      if (res.error) throw res.error;
+    } catch (e) { console.error('placar:', e); markOffline(); }
+    ids.forEach(id => { pending[id]--; });
+    if (ids.every(id => !busy(id))) fetchAll();   // confere o valor final gravado no banco
   }
 
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); else clearTimeout(pollTimer); });
+  function connect() {
+    if (!SUPABASE_URL || !SUPABASE_KEY || !window.supabase) { markOffline(); return; }
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
+    sb.channel('placar-acamp')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'pacotes' }, payload => {
+        const r = payload.new;
+        if (r && r.id) applyRemote({ [r.id]: r.qty });
+      })
+      .subscribe(status => {
+        if (status === 'SUBSCRIBED') { realtimeOk = true; fetchAll(); }
+        else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') { realtimeOk = false; fetchAll(); }
+      });
+    fetchAll();
+    schedulePoll();
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) { fetchAll(); schedulePoll(); } else clearTimeout(pollTimer);
+  });
 
   undoBtn.addEventListener('click', () => {
     if (!snapshot) return;
@@ -700,7 +724,6 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
   const clone = () => items.map(i => ({ ...i }));
   const findItem = card => items.find(i => i.id === card?.dataset.id);
 
-  const typing = {};
   list.addEventListener('input', e => {
     const input = e.target.closest('[data-field="qty"]');
     if (!input) return;
@@ -709,9 +732,8 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
     item.qty = toQty(input.value);
     updateCard(card, item, true);
     refreshTotals();
-    lastWriteAt = Date.now();
     clearTimeout(typing[item.id]);
-    typing[item.id] = setTimeout(() => send({ op: 'set', id: item.id, qty: item.qty }), 600);
+    typing[item.id] = setTimeout(() => { typing[item.id] = 0; send({ op: 'set', id: item.id, qty: item.qty }); }, 600);
   });
   list.addEventListener('change', e => {
     const input = e.target.closest('[data-field="qty"]');
@@ -756,7 +778,7 @@ tfoot td{font-weight:700;border-bottom:0;font-family:var(--font-display);font-si
   }
 
   renderAll();
-  poll();
+  connect();
 })();
 </script>
 </body>
