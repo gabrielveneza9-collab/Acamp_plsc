@@ -1,0 +1,5 @@
+﻿# Arquivos de trabalho que não fazem parte do site
+*.xlsx
+~$*
+tabela-pontuacao.png
+calculadora-pontos.html
